@@ -1,11 +1,14 @@
 import datetime
 import json
 import asyncio
+import threading
+
 
 import telebot
 from telebot.types import ReplyKeyboardRemove as RemoveMarkup
 from telebot import types
 from sqlalchemy import exc
+import requests
 
 from database import database_handler
 import bot_config as cfg
@@ -20,7 +23,7 @@ def start_help(message):
         bot.send_message(message.chat.id, text="Бот для рассылки опросов\nПожалуйста, перейдите в ЛС бота и "
                                                "напишите /join, чтобы разрешить отправлять вам сообщения.")
         return
-    bot.send_message(message.chat.id, text=cfg.HELP_MSG, reply_markup=get_help_keyboard())
+    bot.send_message(message.chat.id, text="Приветствую!\nРегистрация в системе опросов -  /join\nВаш статус в системе опросов - /status", reply_markup=get_help_keyboard())
 
 
 @bot.message_handler(commands=["chat_id"])
@@ -40,23 +43,22 @@ def start_user(message):
         db.create_user(tg_user_id, message.from_user.username, username)
     except exc.IntegrityError:  # Уже был добавлен
         pass
-    bot.send_message(message.from_user.id, "Вы были добавлены в систему")
+    bot.send_message(message.from_user.id, "Вы были добавлены в систему", reply_markup=RemoveMarkup())
 
 
 @bot.message_handler(commands=["status"])
 def status(message):
     if message.chat.id < 0:
-        bot.reply_to(message, "Функционал доступен в только в ЛС")
+        bot.reply_to(message, "Функционал доступен в только в ЛС", reply_markup=RemoveMarkup())
         return
     try:
         user = db.get_user(message.from_user.id)
     except exc.NoResultFound:
-        bot.send_message(message.from_user.id, "Вы не добавлены в систему")
+        bot.send_message(message.from_user.id, "Вы не добавлены в систему", reply_markup=RemoveMarkup())
     else:
         bot.send_message(message.from_user.id,
                          f"{('Роли: ' + ', '.join(user.get_roles()) if user.get_roles() else 'Нет ролей')}; "
-                         f"{('Администратор.' if user.admin else '')}")
-
+                         f"{('Администратор.' if user.admin else '')}", reply_markup=RemoveMarkup())
 
 
 @bot.message_handler(commands=["admin"])
@@ -68,7 +70,15 @@ def start_admin(message):
         bot.send_message(message.from_user.id, "Вы не являетесь администратором")
         return
     bot.send_message(message.from_user.id, "/quest - создать опрос\n"
-                                           "/")
+                                           "/users - список пользователей\n"
+                                           "/roles - список ролей\n"
+                                           "/quests - список опросов\n"
+                                           "/stats <id опроса> - статистика по опросу\n"
+                                           "/userstats <@username пользователя> - статистика пользователя\n"
+                                           "/rolestats <id опроса> <роль> - статистика по опросу конкретной роли\n"
+                                           "/mkrole <@username> <роль> - назначить роль\n"
+                                           "/rmrole <@username> <роль> - снять роль\n",
+                     reply_markup=RemoveMarkup())
 
 
 @bot.message_handler(commands=["roles"])
@@ -142,6 +152,7 @@ def rmrole(message):
     else:
         bot.send_message(message.from_user.id, "Роль снята")
 
+
 @bot.message_handler(commands=["quest"])
 def quest(message, back=False):
     if message.from_user.username not in cfg.admins:
@@ -156,6 +167,7 @@ def quest(message, back=False):
 def quest2(message, question, back=False):
     if not back:
         if message.text == "Отмена":
+            bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
             return
 
         question.text = message.text
@@ -170,6 +182,7 @@ def quest3(message, question, back=False):
             quest(message, question, True)
             return
         if message.text == "Отмена":
+            bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
             return
 
         if message.text == "Опрос с развернутым ответом":
@@ -192,6 +205,7 @@ def quest4(message, question, back=False):
             quest2(message, question, True)
             return
         if message.text == "Отмена":
+            bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
             return
 
         if message.text == "Опрос для всех":
@@ -228,6 +242,7 @@ def quest5(message, question, back=False):
             quest3(message, question, True)
             return
         if message.text == "Отмена":
+            bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
             return
 
         if message.text == "Да":
@@ -251,6 +266,7 @@ def quest6(message, question, back=False):
             quest3(message, question, True)
             return
         if message.text == "Отмена":
+            bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
             return
 
         if message.text == "Отправить прямо сейчас":
@@ -273,6 +289,138 @@ def quest6(message, question, back=False):
         bot.send_message(message.from_user.id,
                          "Опрос добавлен!",
                          reply_markup=RemoveMarkup())
+
+
+def ask(tg_user_id, msg, keyboard, question):
+    message = bot.send_message(tg_user_id, msg, reply_markup=keyboard)
+    re_ask = lambda: ask(tg_user_id, msg, keyboard, question)
+    bot.register_next_step_handler(message, handle_answer, question, re_ask)
+
+
+def handle_answer(message, question, re_ask):
+    print("answered")
+    if question.optional and message.text == 'Пропустить':
+        return
+
+    if options := question.get_answer_options():
+        if message.text.capitalize() not in options:
+            bot.send_message(message.from_user.id, "Ответ не соответствует предложенным вариантам")
+            re_ask()
+            return
+
+    db.create_answer(message.from_user.id, question.id, message.text)
+    bot.send_message(message.from_user.id, "Спасибо за ответ!", reply_markup=RemoveMarkup())
+
+
+@bot.message_handler(commands=["quests"])
+def quests(message):
+    questions = db.get_questions()
+    if not questions:
+        bot.send_message(message.from_user.id, "Нет опросов")
+        return
+    else:
+        msg = ""
+        for question in questions:
+            msg += f"{question.id}. {question.text}\n"
+        bot.send_message(message.from_user.id, msg)
+
+
+@bot.message_handler(commands=["stats"])
+def stats(message):
+    if message.from_user.username not in cfg.admins:
+        return
+
+    _, question_id = parse(message.text, 2)
+    try:
+        question_id = int(question_id)
+        question = db.get_question(question_id)
+    except ValueError:
+        bot.send_message(message.from_user.id, "Ошибка форматирования")
+        return
+    except exc.NoResultFound:
+        bot.send_message(message.from_user.id, "Нет такого опроса")
+        return
+    msg = question.text + "\n\n"
+    answers = db.get_answers(question.id)
+    if options := question.get_answer_options():
+        for option in options:
+            msg += f"{option} - {sum([int(answer.text == option) for answer in answers])} ответов: " \
+                   f"{', '.join([db.get_user(answer.user_id).user_str  for answer in answers if answer.text == option])}\n"
+
+    else:
+        for answer in answers:
+            msg += f"{db.get_user(answer.user_id).user_str} - {answer.text}\n"
+
+    bot.send_message(message.from_user.id, msg)
+
+
+@bot.message_handler(commands=["userstats"])
+def user_stats(message):
+    if message.from_user.username not in cfg.admins:
+        return
+
+    try:
+        _, username = parse(message.text, 2)
+        user = db.get_user(username=username.replace("@", ''))
+    except exc.NoResultFound:
+        bot.send_message(message.from_user.id, "Пользователь не найден")
+        return
+    except Exception:
+        bot.send_message(message.from_user.id, "Ошибка форматирования")
+        return
+
+    answers = db.get_answers(tg_user_id=user.tg_user_id)
+    msg = f"Статистика {user.user_str}\n"
+    if not answers:
+        msg += "Нет ответов"
+    for answer in answers:
+        msg += f"{db.get_question(answer.question_id).text} - {answer.text}\n"
+    bot.send_message(message.from_user.id, msg)
+
+
+@bot.message_handler(commands=["rolestats"])
+def role_stats(message):
+    if message.from_user.username not in cfg.admins:
+        return
+
+
+    try:
+        _, question_id, role = parse(message.text, 3)
+        question_id = int(question_id)
+        question = db.get_question(question_id)
+    except exc.NoResultFound:
+        bot.send_message(message.from_user.id, "Нет такого опроса")
+        return
+    except Exception:
+        bot.send_message(message.from_user.id, "Ошибка форматирования")
+        return
+
+    msg = question.text + "\n\n"
+    answers = db.get_answers(question.id, role=role)
+    if options := question.get_answer_options():
+        for option in options:
+            msg += f"{option} - {sum([int(answer.text == option) for answer in answers])} ответов " \
+                   f"({', '.join([db.get_user(answer.user_id).user_str for answer in answers])})\n"
+
+    else:
+        for answer in answers:
+            msg += f"{db.get_user(answer.user_id).user_str} - {answer.text}"
+
+    bot.send_message(message.from_user.id, msg)
+
+
+"""Utils:"""
+
+
+def form_question(question):
+    msg = question.text + "\n\n"
+    if options := question.get_answer_options():
+        msg += f"Варианты ответа: {'; '.join(options)}"
+    else:
+        msg += f"Это вопрос с развернутым ответом."
+    if question.optional:
+        msg += f"\nЭто необязательный вопрос. Можно пропустить нажатием соответствующей кнопки."
+    return msg
 
 
 def parse(text, n):
@@ -353,17 +501,61 @@ def get_admin_keyboard():
     keyboard.row(key_join, key_status)
     return keyboard
 
+
+def get_question_keyboard(options, optional):
+    keyboard = types.ReplyKeyboardMarkup()
+    keys = []
+    for i, option in enumerate(options):
+        key = types.KeyboardButton(option)
+        keys.append(key)
+        if ((i % 3 == 0) and i) or i == len(options) - 1:
+            if keys:
+                keyboard.row(*keys)
+            keys = []
+
+    if optional:
+        keyboard.row(types.KeyboardButton("Пропустить"))
+    return keyboard
+
+
+"""RUN:"""
+
+
 def main():
-    pass
+    loop = asyncio.get_event_loop()
+    loop.create_task(polling_coro())
+    loop.create_task(question_coro())
+    loop.run_forever()
+
 
 async def polling_coro():
+    print("Bot is running")
     while True:
         try:
-            bot.polling()
-        except Exception:
+            loop = asyncio.get_running_loop()
+            polling = loop.run_in_executor(None, bot.polling)
+            await polling
+        except requests.exceptions.ReadTimeout:
             print("renewing connection")
 
-if __name__ == '__main__':
-    print("running")
-    bot.polling()
 
+async def question_coro():
+    print("Question sender is running")
+    while True:
+        question = db.get_outdated_question()
+        if question:
+            print("Outdated question was found")
+            msg = form_question(question)
+            keyboard = get_question_keyboard(question.get_answer_options(), question.optional)
+
+            users = db.get_users()
+            for user in users:
+                if question.for_all or user.tg_user_id in question.get_users_for() or \
+                        (True in [role in question.get_roles_for() for role in user.get_roles()]):
+                    ask(user.tg_user_id, msg, keyboard, question)
+
+        await asyncio.sleep(5)
+
+
+if __name__ == '__main__':
+    main()

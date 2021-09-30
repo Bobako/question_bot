@@ -3,7 +3,7 @@ import copy
 import json
 
 import sqlalchemy
-from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, desc
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -29,7 +29,7 @@ class Role(Base):
     def remove_user(self, tg_user_id):
         users = json.loads(self.users_json)
         users.pop(users.index(tg_user_id))
-        self.users_json = json.dumps(tg_user_id)
+        self.users_json = json.dumps(list(set(users)))
 
     def get_users(self):
         return json.loads(self.users_json)
@@ -119,7 +119,7 @@ class Handler:
             self.database_path = database_path
         engine = sqlalchemy.create_engine(f"sqlite:///{self.database_path}")
         base.metadata.create_all(engine)
-        self.session = sessionmaker(bind=engine)
+        self.session = sessionmaker(bind=engine, expire_on_commit=False)
 
     def create_role(self, name):
         if not name in [role.name for role in self.get_roles()]:
@@ -167,7 +167,7 @@ class Handler:
         elif username:
             user = copy.deepcopy(session.query(User).filter(User.username == username).one())
         else:
-            raise ValueError("tg_user_id or username were not given")
+            raise AttributeError("tg_user_id or username were not given")
         session.close()
         return user
 
@@ -204,3 +204,50 @@ class Handler:
         session = self.session()
         session.add(question_obj)
         session.commit()
+
+    def get_outdated_question(self):
+        session = self.session()
+        question = session.query(Question).filter(Question.sent == False).\
+            filter(Question.send_datetime <= datetime.datetime.now()).first()
+        if not question:
+            return None
+        question.sent = True
+        session.commit()
+        return copy.deepcopy(question)
+
+    def create_answer(self, tg_user_id, question_id, text):
+        answer = Answer(tg_user_id, question_id, text)
+        session = self.session()
+        session.add(answer)
+        session.commit()
+
+    def get_questions(self):
+        session = self.session()
+        questions = copy.deepcopy(session.query(Question).order_by(desc(Question.send_datetime)).all())
+        session.close()
+        return questions
+
+    def get_question(self, question_id):
+        session = self.session()
+        question = copy.deepcopy(session.query(Question).filter(Question.id == question_id).one())
+        session.close()
+        return question
+
+    def get_answers(self, question_id=None, tg_user_id=None, role=None):
+        session = self.session()
+        if question_id:
+            if not role:
+                answers = copy.deepcopy(session.query(Answer).filter(Answer.question_id == question_id).all())
+            else:
+                answers = copy.deepcopy(session.query(Answer).filter(Answer.question_id == question_id).all())
+                tmp = []
+                for answer in answers:
+                    if role in self.get_user(answer.user_id).get_roles():
+                        tmp.append(answer)
+                answers = tmp
+        elif tg_user_id:
+            answers = copy.deepcopy(session.query(Answer).filter(Answer.user_id == tg_user_id).all())
+        else:
+            raise AttributeError("Attrs were not given")
+        session.close()
+        return answers
