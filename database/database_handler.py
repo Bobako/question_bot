@@ -42,6 +42,8 @@ class User(Base):
     user_str = Column(String)
     roles_json = Column(String)
     admin = Column(Boolean)
+    answered_last_question = Column(Boolean)
+    last_question_notifications = Column(Integer)
 
     def __init__(self, tg_user_id, username=None, user_str=None):
         self.tg_user_id = tg_user_id
@@ -49,6 +51,8 @@ class User(Base):
         self.user_str = user_str
         self.roles_json = json.dumps([])
         self.admin = username in cfg.admins
+        self.answered_last_question = True
+        self.last_question_notifications = 0
 
     def add_role(self, role):
         roles = json.loads(self.roles_json)
@@ -57,8 +61,12 @@ class User(Base):
 
     def remove_role(self, role):
         roles = json.loads(self.roles_json)
-        roles.pop(roles.index(role))
-        self.roles_json = json.dumps(roles)
+        try:
+            roles.pop(roles.index(role))
+        except ValueError:
+            pass
+        else:
+            self.roles_json = json.dumps(roles)
 
     def get_roles(self):
         return json.loads(self.roles_json)
@@ -75,6 +83,7 @@ class Question(Base):
     optional = Column(Boolean)
     send_datetime = Column(DateTime)
     sent = Column(Boolean)
+    sent_to_json = Column(String)
 
     def __init__(self, text: str = '', for_all: bool = False, roles_for: list = [], users_for: list = [],
                  answer_options: list = [], optional: bool = [],
@@ -87,6 +96,7 @@ class Question(Base):
         self.optional = optional
         self.send_datetime = send_datetime
         self.sent = False
+        self.sent_to_json = json.dumps([])
 
     def get_roles_for(self):
         return json.loads(self.roles_for_json)
@@ -96,6 +106,9 @@ class Question(Base):
 
     def get_answer_options(self):
         return json.loads(self.answer_options_json)
+
+    def get_sent_to(self):
+        return json.loads(self.sent_to_json)
 
 
 class Answer(Base):
@@ -207,12 +220,11 @@ class Handler:
 
     def get_outdated_question(self):
         session = self.session()
-        question = session.query(Question).filter(Question.sent == False).\
+        question = session.query(Question).filter(Question.sent == False). \
             filter(Question.send_datetime <= datetime.datetime.now()).first()
         if not question:
             return None
-        question.sent = True
-        session.commit()
+        session.close()
         return copy.deepcopy(question)
 
     def create_answer(self, tg_user_id, question_id, text):
@@ -251,3 +263,22 @@ class Handler:
             raise AttributeError("Attrs were not given")
         session.close()
         return answers
+
+    def update_user(self, tg_id, answered_last_question=None, last_question_notifications=None):
+        session = self.session()
+        user = session.query(User).filter(User.tg_user_id == tg_id).one()
+        if not answered_last_question is None:
+            user.answered_last_question = answered_last_question
+        if not last_question_notifications is None:
+            user.last_question_notifications = last_question_notifications
+        session.commit()
+
+    def update_question(self, id_, sent_to=None, sent=None):
+        session = self.session()
+        question = session.query(Question).filter(Question.id == id_).one()
+        if not sent_to is None:
+            question.sent_to_json = json.dumps(sent_to)
+        if not sent is None:
+            question.sent = sent
+
+        session.commit()

@@ -3,7 +3,6 @@ import json
 import asyncio
 import threading
 
-
 import telebot
 from telebot.types import ReplyKeyboardRemove as RemoveMarkup
 from telebot import types
@@ -23,7 +22,9 @@ def start_help(message):
         bot.send_message(message.chat.id, text="Бот для рассылки опросов\nПожалуйста, перейдите в ЛС бота и "
                                                "напишите /join, чтобы разрешить отправлять вам сообщения.")
         return
-    bot.send_message(message.chat.id, text="Приветствую!\nРегистрация в системе опросов -  /join\nВаш статус в системе опросов - /status", reply_markup=get_help_keyboard())
+    bot.send_message(message.chat.id,
+                     text="Приветствую!\nРегистрация в системе опросов -  /join\nВаш статус в системе опросов - /status",
+                     reply_markup=get_help_keyboard())
 
 
 @bot.message_handler(commands=["chat_id"])
@@ -77,7 +78,8 @@ def start_admin(message):
                                            "/userstats <@username пользователя> - статистика пользователя\n"
                                            "/rolestats <id опроса> <роль> - статистика по опросу конкретной роли\n"
                                            "/mkrole <@username> <роль> - назначить роль\n"
-                                           "/rmrole <@username> <роль> - снять роль\n",
+                                           "/rmrole <@username> <роль> - снять роль\n"
+                                           "/delrole <роль> - удалить роль как таковую\n",
                      reply_markup=RemoveMarkup())
 
 
@@ -190,7 +192,7 @@ def quest3(message, question, back=False):
         else:
             options = message.text.split(';')
             for i, option in enumerate(options):
-                options[i] = option.strip(" ").capitalize()
+                options[i] = option.strip(" ")
             question.answer_options_json = json.dumps(options)
 
     bot.send_message(message.from_user.id,
@@ -303,7 +305,7 @@ def handle_answer(message, question, re_ask):
         return
 
     if options := question.get_answer_options():
-        if message.text.capitalize() not in options:
+        if message.text not in options:
             bot.send_message(message.from_user.id, "Ответ не соответствует предложенным вариантам")
             re_ask()
             return
@@ -345,7 +347,7 @@ def stats(message):
     if options := question.get_answer_options():
         for option in options:
             msg += f"{option} - {sum([int(answer.text == option) for answer in answers])} ответов: " \
-                   f"{', '.join([db.get_user(answer.user_id).user_str  for answer in answers if answer.text == option])}\n"
+                   f"{', '.join([db.get_user(answer.user_id).user_str for answer in answers if answer.text == option])}\n"
 
     else:
         for answer in answers:
@@ -383,7 +385,6 @@ def role_stats(message):
     if message.from_user.username not in cfg.admins:
         return
 
-
     try:
         _, question_id, role = parse(message.text, 3)
         question_id = int(question_id)
@@ -409,13 +410,27 @@ def role_stats(message):
     bot.send_message(message.from_user.id, msg)
 
 
+@bot.message_handler(commands=["delrole"])
+def delrole(message):
+    if message.from_user.username not in cfg.admins:
+        return
+    _, role = parse(message, 2)
+    try:
+        db.remove_role(role)
+    except exc.NoResultFound:
+        bot.send_message(message.from_user.id, "Такой роли нет")
+    else:
+        bot.send_message(message.from_user.id, "Роль удалена")
+
+
 """Utils:"""
 
 
 def form_question(question):
     msg = question.text + "\n\n"
     if options := question.get_answer_options():
-        msg += f"Варианты ответа: {'; '.join(options)}"
+        msg += 'Варианты ответа:\n'
+        msg += "\n".join(options)
     else:
         msg += f"Это вопрос с развернутым ответом."
     if question.optional:
@@ -504,14 +519,8 @@ def get_admin_keyboard():
 
 def get_question_keyboard(options, optional):
     keyboard = types.ReplyKeyboardMarkup()
-    keys = []
-    for i, option in enumerate(options):
-        key = types.KeyboardButton(option)
-        keys.append(key)
-        if ((i % 3 == 0) and i) or i == len(options) - 1:
-            if keys:
-                keyboard.row(*keys)
-            keys = []
+    for option in options:
+        keyboard.row(types.KeyboardButton(option))
 
     if optional:
         keyboard.row(types.KeyboardButton("Пропустить"))
@@ -549,10 +558,21 @@ async def question_coro():
             keyboard = get_question_keyboard(question.get_answer_options(), question.optional)
 
             users = db.get_users()
+            already_sent = question.get_sent_to()
+            users_to_send = []
+            sent = True
             for user in users:
                 if question.for_all or user.tg_user_id in question.get_users_for() or \
                         (True in [role in question.get_roles_for() for role in user.get_roles()]):
-                    ask(user.tg_user_id, msg, keyboard, question)
+                    if user.tg_user_id not in already_sent:
+                        if user.answered_last_question:
+                            ask(user.tg_user_id, msg, keyboard, question)
+                            users_to_send.append(user.tg_user_id)
+                        else:
+                            sent = False
+
+
+
 
         await asyncio.sleep(5)
 
