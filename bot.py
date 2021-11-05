@@ -297,6 +297,23 @@ def ask(tg_user_id, msg, keyboard, question):
     message = bot.send_message(tg_user_id, msg, reply_markup=keyboard)
     re_ask = lambda: ask(tg_user_id, msg, keyboard, question)
     bot.register_next_step_handler(message, handle_answer, question, re_ask)
+    loop = asyncio.get_running_loop()
+    loop.create_task(notify_if_not_respond(tg_user_id))
+
+async def notify_if_not_respond(tg_user_id):
+    while True:
+        await asyncio.sleep(30*60)
+        user = db.get_user(tg_user_id)
+        if (not user.answered_last_question) and user.last_question_notifications < 2:
+            bot.send_message(user.tg_user_id, "Ответьте на опрос, пожалуйста!")
+            db.update_user(user.tg_user_id, last_question_notifications=user.last_question_notifications+1)
+        elif (not user.answered_last_question) and user.last_question_notifications == 2:
+            db.update_user(user.tg_user_id, True, 0)
+            return
+        else:
+            return
+
+
 
 
 def handle_answer(message, question, re_ask):
@@ -311,6 +328,7 @@ def handle_answer(message, question, re_ask):
             return
 
     db.create_answer(message.from_user.id, question.id, message.text)
+    db.update_user(message.from_user.id, True, 0)
     bot.send_message(message.from_user.id, "Спасибо за ответ!", reply_markup=RemoveMarkup())
 
 
@@ -564,17 +582,16 @@ async def question_coro():
             for user in users:
                 if question.for_all or user.tg_user_id in question.get_users_for() or \
                         (True in [role in question.get_roles_for() for role in user.get_roles()]):
-                    if user.tg_user_id not in already_sent:
-                        if user.answered_last_question:
-                            ask(user.tg_user_id, msg, keyboard, question)
-                            users_to_send.append(user.tg_user_id)
-                        else:
-                            sent = False
+                    if user.tg_user_id not in already_sent and user.answered_last_question:
+                        users_to_send.append(user.tg_user_id)
+                        ask(user.tg_user_id, msg, keyboard, question)
+                        db.update_user(user.tg_user_id, answered_last_question=False)
+                    else:
+                        sent = False
+            already_sent += users_to_send
+            db.update_question(question.id, already_sent, sent)
 
-
-
-
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
 
 if __name__ == '__main__':
