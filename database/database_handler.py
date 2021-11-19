@@ -44,6 +44,7 @@ class User(Base):
     admin = Column(Boolean)
     answered_last_question = Column(Boolean)
     last_question_notifications = Column(Integer)
+    bx_id = Column(Integer)
 
     def __init__(self, tg_user_id, username=None, user_str=None):
         self.tg_user_id = tg_user_id
@@ -130,7 +131,7 @@ class Handler:
     def __init__(self, database_path=None, base=Base):
         if database_path:
             self.database_path = database_path
-        engine = sqlalchemy.create_engine(f"sqlite:///{self.database_path}")
+        engine = sqlalchemy.create_engine(f"sqlite:///{self.database_path}" + '?check_same_thread=False')
         base.metadata.create_all(engine)
         self.session = sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -146,7 +147,8 @@ class Handler:
         role = session.query(Role).filter(Role.name == name).one()
         users = role.get_users()
         for user in users:
-            self.get_user(user).remove_role(name)
+            user = session.query(User).filter(User.tg_user_id == user).one()
+            user.remove_role(name)
         session.delete(role)
         session.commit()
 
@@ -264,13 +266,15 @@ class Handler:
         session.close()
         return answers
 
-    def update_user(self, tg_id, answered_last_question=None, last_question_notifications=None):
+    def update_user(self, tg_id, answered_last_question=None, last_question_notifications=None, bx_id=None):
         session = self.session()
         user = session.query(User).filter(User.tg_user_id == tg_id).one()
         if not answered_last_question is None:
             user.answered_last_question = answered_last_question
         if not last_question_notifications is None:
             user.last_question_notifications = last_question_notifications
+        if not bx_id == None:
+            user.bx_id = bx_id
         session.commit()
 
     def update_question(self, id_, sent_to=None, sent=None):

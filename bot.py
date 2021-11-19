@@ -1,19 +1,160 @@
 import datetime
 import json
 import asyncio
-import threading
+import time
 
 import telebot
 from telebot.types import ReplyKeyboardRemove as RemoveMarkup
 from telebot import types
 from sqlalchemy import exc
 import requests
+from bitrix24 import Bitrix24
 
 from database import database_handler
 import bot_config as cfg
 
+
+class Callback:
+    callback_funcs = {}
+    inline_messages = {}
+
+    def __init__(self):
+        pass
+
+    def register_callback(self, message, func, *args):
+        self.delete_old_inline(message.chat.id)
+        key = str(message.chat.id) + str(message.id)
+        self.callback_funcs[key] = [func, args]
+        self.inline_messages[message.chat.id] = message.id
+
+    def run_callback(self, call):
+        bot.answer_callback_query(call.id)
+        bot.delete_message(call.message.chat.id, call.message.id)
+        key = str(call.message.chat.id) + str(call.message.id)
+        try:
+            func, args = self.callback_funcs[key]
+        except KeyError:
+            return
+        func(call, *args)
+
+    def delete_old_inline(self, uid):
+        if uid in self.inline_messages:
+            if self.inline_messages[uid]:
+                try:
+                    bot.delete_message(uid, self.inline_messages[uid])
+                except Exception:
+                    pass
+                self.inline_messages[uid] = None
+
+
 db = database_handler.Handler("database/db.db")
 bot = telebot.TeleBot(cfg.TOKEN)
+bx24 = Bitrix24(cfg.BITRIX_URL)
+cb = Callback()
+
+
+def count_lead_stats(leads):
+    print(leads)
+    converted = 0
+    in_work = 0
+    for lead in leads:
+        if lead["STATUS_ID"] == 'CONVERTED':
+            converted += 1
+        if lead["DATE_CLOSED"] == '':
+            in_work += 1
+    leads = len(leads)
+    if leads:
+        conversion = f"{(converted / leads * 100):.1f}%"
+    else:
+        conversion = "0.0%"
+    return f"Лидов: {leads}\nПродаж: {converted}\nКонверсия: {conversion}\nНезакрытых лидов: {in_work}"
+
+
+def get_leads(ids, days=1):
+    days = days - 1
+    then = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
+    leads = []
+    l_ids = len(ids)
+    for i, id_ in enumerate(ids):
+        yield f"Загрузка...{(i / l_ids * 100):.1f}%"
+        filter_ = {'>DATE_CREATE': then,
+                   'CREATED_BY_ID': str(id_)}
+        leads_by_id = bx24.callMethod("crm.lead.list", filter=filter_)
+        time.sleep(0.5)
+        leads += leads_by_id
+    yield leads
+
+
+@bot.message_handler(commands=["bx"])
+def bx1(message):
+    if message.from_user.username not in cfg.admins:
+        bot.send_message(message.from_user.id, "Вы не являетесь администратором")
+        return
+    bot.send_message(message.from_user.id,
+                     "Роли и пользователи (@имя), статистику для которых нужно получить:",
+                     reply_markup=get_quest3_keyboard())
+    bot.register_next_step_handler(message, bx2)
+
+
+def bx2(message):
+    if message.text in ["Отмена", "Назад"]:
+        bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
+        return
+    if message.text == "Для всех":
+        users = db.get_users()
+        tg_ids = [user.tg_user_id for user in users]
+    else:
+        tg_ids = []
+        groups = message.text.split(";")
+        roles = []
+
+        for group in groups:
+            if "@" in group:
+                username = group[group.find("@") + 1:].strip()
+                try:
+                    tg_ids.append(db.get_user(username=username).tg_user_id)
+                except exc.NoResultFound:
+                    bot.send_message(message.from_user.id, f"@{username} нет в системе")
+            else:
+                roles.append(group.strip())
+
+        for role in roles:
+            tg_ids += db.get_role(role).get_users()
+    bx_ids = [db.get_user(tg_id).bx_id for tg_id in tg_ids]
+    bot.send_message(message.from_user.id, "Для скольки дней получить статистику (включая сегодня)?",
+                     reply_markup=days_keyboard())
+    bot.register_next_step_handler(message, bx3, bx_ids)
+
+
+def bx3(message, ids):
+    if message.text == "Отмена":
+        bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
+        return
+
+    days = int(message.text)
+    mid = None
+    for r in get_leads(ids, days):
+        if type(r) == str:
+            if not mid:
+                mid = bot.send_message(message.from_user.id, r).id
+            else:
+                bot.edit_message_text(r, message.from_user.id, mid)
+        else:
+            bot.delete_message(message.from_user.id, mid)
+            bot.send_message(message.from_user.id, count_lead_stats(r), reply_markup=RemoveMarkup())
+
+
+def days_keyboard():
+    keyboard = types.ReplyKeyboardMarkup()
+    keyboard.row(types.KeyboardButton('30'), types.KeyboardButton('7'), types.KeyboardButton('1'))
+    key_cancel = types.KeyboardButton('Отмена')
+    keyboard.row(key_cancel)
+    return keyboard
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback(call):
+    cb.run_callback(call)
 
 
 @bot.message_handler(commands=["help", "start"])
@@ -23,7 +164,8 @@ def start_help(message):
                                                "напишите /join, чтобы разрешить отправлять вам сообщения.")
         return
     bot.send_message(message.chat.id,
-                     text="Приветствую!\nРегистрация в системе опросов -  /join\nВаш статус в системе опросов - /status",
+                     text="Приветствую!\nРегистрация в системе опросов -  /join\n"
+                          "Ваш статус в системе опросов - /status",
                      reply_markup=get_help_keyboard())
 
 
@@ -38,13 +180,45 @@ def start_user(message):
     if message.chat.id < 0:
         bot.reply_to(message, "Для регистрации в системе необходимо написать именно в личные сообщения боту")
         return
-    username = msg_user_to_username(message.from_user)
-    tg_user_id = message.from_user.id
-    try:
-        db.create_user(tg_user_id, message.from_user.username, username)
-    except exc.IntegrityError:  # Уже был добавлен
-        pass
-    bot.send_message(message.from_user.id, "Вы были добавлены в систему", reply_markup=RemoveMarkup())
+    msg = "Укажите свой ID из BITRIX24:"
+    bot.send_message(message.from_user.id, msg, reply_markup=RemoveMarkup())
+    bot.register_next_step_handler(message, add_id)
+
+
+def add_id(message):
+    id_ = message.text
+    user = bx24.callMethod("user.get", filter={'ID': id_})
+    if not user:
+        bot.send_message(message.chat.id, "Не удалось найти такого пользователя.")
+        return
+    user = user[0]
+    name = f"{user['NAME']} {user['LAST_NAME']}"
+    msg = f"{name}, верно?"
+    message = bot.send_message(message.chat.id, msg, reply_markup=add_id_keyboard())
+    cb.register_callback(message, add_id2, id_, name)
+
+
+def add_id2(call, bx_id, name):
+    if call.data == "Yes":
+        username = name + (f" (@{call.from_user.username})" if call.from_user.username else '')
+        tg_user_id = call.from_user.id
+        try:
+            db.create_user(tg_user_id, call.from_user.username, username)
+        except exc.IntegrityError:  # Уже был добавлен
+            pass
+        db.update_user(call.from_user.id, bx_id=bx_id)
+        bot.send_message(call.from_user.id, "Вы добавлены в систему")
+    else:
+        bot.send_message(call.from_user.id, "Регистрация отменена")
+
+
+def add_id_keyboard():
+    k = types.InlineKeyboardMarkup()
+    k.row(
+        types.InlineKeyboardButton(text="Да", callback_data="Yes"),
+        types.InlineKeyboardButton(text="Нет, отменить регистрицию", callback_data="No")
+    )
+    return k
 
 
 @bot.message_handler(commands=["status"])
@@ -79,7 +253,8 @@ def start_admin(message):
                                            "/rolestats <id опроса> <роль> - статистика по опросу конкретной роли\n"
                                            "/mkrole <@username> <роль> - назначить роль\n"
                                            "/rmrole <@username> <роль> - снять роль\n"
-                                           "/delrole <роль> - удалить роль как таковую\n",
+                                           "/delrole <роль> - удалить роль как таковую\n"
+                                           "/bx - просмотр статистики из bitrix",
                      reply_markup=RemoveMarkup())
 
 
@@ -156,7 +331,7 @@ def rmrole(message):
 
 
 @bot.message_handler(commands=["quest"])
-def quest(message, back=False):
+def quest(message):
     if message.from_user.username not in cfg.admins:
         return
 
@@ -181,7 +356,7 @@ def quest2(message, question, back=False):
 def quest3(message, question, back=False):
     if not back:
         if message.text == "Назад":
-            quest(message, question, True)
+            quest(message, question)
             return
         if message.text == "Отмена":
             bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
@@ -210,7 +385,7 @@ def quest4(message, question, back=False):
             bot.send_message(message.from_user.id, "Отменено.", reply_markup=RemoveMarkup())
             return
 
-        if message.text == "Опрос для всех":
+        if message.text == "Для всех":
             question.for_all = True
         else:
             question.for_all = False
@@ -275,9 +450,9 @@ def quest6(message, question, back=False):
             question.send_datetime = datetime.datetime.now()
         else:
             try:
-                date, time = message.text.split(" ")
+                date, time_ = message.text.split(" ")
                 day, month, year = map(int, date.split("."))
-                hour, minute = map(int, time.split(":"))
+                hour, minute = map(int, time_.split(":"))
 
                 question.send_datetime = datetime.datetime(year, month, day, hour, minute, 0)
             except Exception:
@@ -297,16 +472,20 @@ def ask(tg_user_id, msg, keyboard, question):
     message = bot.send_message(tg_user_id, msg, reply_markup=keyboard)
     re_ask = lambda: ask(tg_user_id, msg, keyboard, question)
     bot.register_next_step_handler(message, handle_answer, question, re_ask)
-    loop = asyncio.get_running_loop()
-    loop.create_task(notify_if_not_respond(tg_user_id))
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(notify_if_not_respond(tg_user_id))
+    except Exception:
+        pass
+
 
 async def notify_if_not_respond(tg_user_id):
     while True:
-        await asyncio.sleep(30*60)
+        await asyncio.sleep(30 * 60)
         user = db.get_user(tg_user_id)
         if (not user.answered_last_question) and user.last_question_notifications < 2:
             bot.send_message(user.tg_user_id, "Ответьте на опрос, пожалуйста!")
-            db.update_user(user.tg_user_id, last_question_notifications=user.last_question_notifications+1)
+            db.update_user(user.tg_user_id, last_question_notifications=user.last_question_notifications + 1)
         elif (not user.answered_last_question) and user.last_question_notifications == 2:
             db.update_user(user.tg_user_id, True, 0)
             return
@@ -314,13 +493,10 @@ async def notify_if_not_respond(tg_user_id):
             return
 
 
-
-
 def handle_answer(message, question, re_ask):
-    print("answered")
     if question.optional and message.text == 'Пропустить':
         return
-
+    print(f"answered: {message.text}")
     if options := question.get_answer_options():
         if message.text not in options:
             bot.send_message(message.from_user.id, "Ответ не соответствует предложенным вариантам")
@@ -432,7 +608,7 @@ def role_stats(message):
 def delrole(message):
     if message.from_user.username not in cfg.admins:
         return
-    _, role = parse(message, 2)
+    _, role = parse(message.text, 2)
     try:
         db.remove_role(role)
     except exc.NoResultFound:
@@ -498,7 +674,7 @@ def get_quest2_keyboard():
 
 def get_quest3_keyboard():
     keyboard = types.ReplyKeyboardMarkup()
-    key_no_options = types.KeyboardButton('Опрос для всех')
+    key_no_options = types.KeyboardButton('Для всех')
     keyboard.row(key_no_options)
     key_back = types.KeyboardButton('Назад')
     key_cancel = types.KeyboardButton('Отмена')
